@@ -3,19 +3,19 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>GERSIU Raycaster</title>
+<title>GERSIU 3D Raycaster Deluxe</title>
 <style>
-  html,body{margin:0;height:100%;background:#111;color:#fff;font-family:monospace;overflow:hidden}
+  html,body{margin:0;height:100%;background:#0f0f13;color:#fff;font-family:Consolas,monospace;overflow:hidden}
   #wrap{position:relative;width:100vw;height:100vh}
   canvas{width:100%;height:100%;display:block;image-rendering:pixelated;cursor:crosshair}
-  #ui{position:absolute;left:10px;top:10px;z-index:4;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  button{background:#222;border:1px solid #555;color:#fff;padding:6px 10px;font:inherit;cursor:pointer}
-  button:hover{background:#333}
-  #score{position:absolute;right:12px;top:10px;z-index:4;font-size:20px;font-weight:700;background:rgba(0,0,0,.45);padding:6px 10px;border:1px solid #666;transform-origin:center}
-  #score.pulse{animation:pulse .28s ease-out}
-  @keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.35)}100%{transform:scale(1)}}
-  #hud{position:absolute;left:10px;bottom:8px;z-index:4;background:rgba(0,0,0,.45);padding:6px;border:1px solid #555;font-size:12px;white-space:pre}
-  #hint{position:absolute;left:50%;top:8px;transform:translateX(-50%);z-index:4;background:rgba(0,0,0,.45);padding:4px 8px;border:1px solid #555;font-size:12px}
+  #ui{position:absolute;left:10px;top:10px;z-index:5;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button{background:#1f1f25;border:1px solid #666;color:#fff;padding:6px 10px;font:inherit;cursor:pointer}
+  button:hover{background:#2a2a34}
+  #score{position:absolute;right:12px;top:10px;z-index:5;font-size:22px;font-weight:700;background:rgba(0,0,0,.5);padding:6px 10px;border:1px solid #777;transform-origin:center}
+  #score.pulse{animation:pulse .3s ease-out}
+  @keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.34)}100%{transform:scale(1)}}
+  #hud{position:absolute;left:10px;bottom:10px;z-index:5;background:rgba(0,0,0,.48);padding:6px;border:1px solid #666;font-size:12px;white-space:pre}
+  #hint{position:absolute;left:50%;top:10px;transform:translateX(-50%);z-index:5;background:rgba(0,0,0,.5);padding:4px 10px;border:1px solid #666;font-size:12px}
 </style>
 </head>
 <body>
@@ -26,29 +26,29 @@
     <button id="mapBtn">Toggle Minimap (M)</button>
   </div>
   <div id="score">GERSIUS KILLED: <span id="kills">0</span></div>
-  <div id="hint">Click canvas for mouse look (Pointer Lock). E = door, LMB/Space = sword.</div>
+  <div id="hint">Click canvas: Pointer Lock. WASD move, Mouse X/Y look, E door, LMB/Space sword, ESC unlock.</div>
   <div id="hud"></div>
 </div>
 <script>
 (function(){
   /*
     Plan:
-    1) map/doors: build exactly 5 separated rooms, closed/open door state + collision.
-    2) raycaster: DDA per column with depth buffer, low-res internal render scaled to canvas.
-    3) sprites: enemy billboards with z-buffer occlusion and chase AI.
-    4) input: WASD, E doors, pointer lock + drag fallback, attack inputs.
-    5) audio: WebAudio sword/door/kill SFX, speechSynthesis voice lines.
-    6) UI: spawn button, minimap toggle, HUD stats, scoreboard pulse, tests.
+    1) map/doors: build bigger world with open plaza + exactly 5 separated rooms and door states.
+    2) raycaster: DDA wall rendering with z-buffer, low-res offscreen buffer + scaled output.
+    3) sprites: Gersiu billboard "pseudo-3D models" using textured layers and per-column depth checks.
+    4) input: WASD, pointer lock + drag fallback, full mouse axis (yaw+pitch), E interaction.
+    5) audio: WebAudio SFX + ro-RO speech synthesis personalities.
+    6) UI/tests: minimap, HUD, score pulse, runTests assertions.
   */
 
-  const viewCanvas = document.getElementById('game');
-  const vctx = viewCanvas.getContext('2d');
-  const lowW = 400, lowH = 220;
-  const lowCanvas = document.createElement('canvas');
-  lowCanvas.width = lowW; lowCanvas.height = lowH;
-  const ctx = lowCanvas.getContext('2d');
+  const canvas = document.getElementById('game');
+  const out = canvas.getContext('2d');
+  const lowW = 480, lowH = 270;
+  const low = document.createElement('canvas');
+  low.width = lowW; low.height = lowH;
+  const ctx = low.getContext('2d', { alpha: false });
   ctx.imageSmoothingEnabled = false;
-  vctx.imageSmoothingEnabled = false;
+  out.imageSmoothingEnabled = false;
 
   const hud = document.getElementById('hud');
   const spawnBtn = document.getElementById('spawnBtn');
@@ -56,413 +56,554 @@
   const killsEl = document.getElementById('kills');
   const scoreEl = document.getElementById('score');
 
-  const mapW = 24, mapH = 16;
-  const world = new Uint8Array(mapW*mapH);
-  const roomId = new Uint8Array(mapW*mapH);
+  const mapW = 40, mapH = 28;
+  const world = new Uint8Array(mapW * mapH);
+  const roomId = new Uint8Array(mapW * mapH);
   const doors = new Map();
+  const zbuf = new Float32Array(lowW);
+  const rayHitX = new Int16Array(lowW);
+  const rayHitY = new Int16Array(lowW);
 
-  const idx=(x,y)=>y*mapW+x;
-  const key=(x,y)=>x+','+y;
-  const get=(x,y)=> (x<0||y<0||x>=mapW||y>=mapH)?1:world[idx(x,y)];
+  const idx = (x, y) => y * mapW + x;
+  const key = (x, y) => x + ',' + y;
+  const cell = (x, y) => (x < 0 || y < 0 || x >= mapW || y >= mapH) ? 1 : world[idx(x, y)];
 
-  function fill(v){ world.fill(v); }
-  function carveRoom(id,x1,y1,x2,y2){
-    for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++){ world[idx(x,y)] = 0; roomId[idx(x,y)] = id; }
+  function fillMap(v){ world.fill(v); roomId.fill(0); }
+  function carveRoom(id, x1, y1, x2, y2){
+    for(let y = y1; y <= y2; y++){
+      for(let x = x1; x <= x2; x++){
+        world[idx(x, y)] = 0;
+        roomId[idx(x, y)] = id;
+      }
+    }
   }
-  function addDoor(x,y){ world[idx(x,y)] = 7; doors.set(key(x,y), {x,y,open:false}); }
+  function carveArea(x1, y1, x2, y2){
+    for(let y = y1; y <= y2; y++) for(let x = x1; x <= x2; x++) world[idx(x, y)] = 0;
+  }
+  function addDoor(x, y){ world[idx(x, y)] = 7; doors.set(key(x, y), { x, y, open: false }); }
 
-  fill(1);
-  carveRoom(1,1,1,5,5);
-  carveRoom(2,7,1,11,5);
-  carveRoom(3,13,1,18,5);
-  carveRoom(4,1,8,10,12);
-  carveRoom(5,12,8,20,12);
-  addDoor(6,3);   // r1-r2
-  addDoor(12,3);  // r2-r3
-  addDoor(4,7);   // r1-r4
-  addDoor(9,7);   // r2-r4
-  addDoor(11,10); // r4-r5
-  addDoor(16,7);  // r3-r5
+  fillMap(1);
+  carveArea(8, 7, 31, 20);      // big open plaza
+  carveArea(4, 12, 7, 15);      // west connector
+  carveArea(32, 12, 35, 15);    // east connector
+  carveArea(18, 4, 21, 6);      // north connector
+  carveArea(18, 21, 21, 23);    // south connector
 
-  const wallRoomColor = {
-    1:'#5a6a7a',
-    2:'#78624f',
-    3:'#4e7a52',
-    4:'#6f4f7a',
-    5:'#7a4e4e'
-  };
+  carveRoom(1, 2, 2, 9, 6);     // NW room
+  carveRoom(2, 14, 1, 25, 5);   // N room
+  carveRoom(3, 30, 2, 37, 6);   // NE room
+  carveRoom(4, 2, 21, 12, 26);  // SW room
+  carveRoom(5, 27, 21, 37, 26); // SE room
 
-  const player = {x:3.5,y:3.5,a:0,hp:100};
-  const cam = {fov:Math.PI/3};
+  addDoor(8, 6);    // room1 -> plaza north-west lane
+  addDoor(19, 6);   // room2 -> north connector
+  addDoor(31, 6);   // room3 -> plaza north-east lane
+  addDoor(12, 21);  // room4 -> south-west lane
+  addDoor(27, 21);  // room5 -> south-east lane
+  addDoor(8, 14);   // extra west plaza door
+  addDoor(31, 14);  // extra east plaza door
+
+  const roomWallBase = {1:'#5f6f82',2:'#7a654a',3:'#4f7a58',4:'#6f5086',5:'#864f4f'};
+
+  const player = { x: 20, y: 14, a: 0.2, pitch: 0 };
+  const cam = { fov: Math.PI / 3 };
+  const enemies = [];
+  const sortBuf = [];
   const keys = Object.create(null);
-  let pointerLocked = false, dragging = false, lastMouseX = 0;
+
+  let pointerLocked = false;
+  let dragging = false;
+  let lastMouseX = 0, lastMouseY = 0;
   let showMinimap = true;
   let kills = 0;
-  const zbuf = new Float32Array(lowW);
-  const enemies = [];
-  let attackTimer = 0;
+  let attackT = 0;
+  let fps = 60;
 
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const ac = AudioCtx ? new AudioCtx() : null;
-  function beep(type,freq,dur,gain){
+  function osc(type, freq, dur, gain){
     if(!ac) return;
-    const o=ac.createOscillator(), g=ac.createGain();
-    o.type=type; o.frequency.value=freq; g.gain.value=gain;
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.value = gain;
     o.connect(g); g.connect(ac.destination);
-    const t=ac.currentTime;
-    g.gain.setValueAtTime(gain,t); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
-    o.start(t); o.stop(t+dur);
+    const t = ac.currentTime;
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.start(t); o.stop(t + dur);
   }
-  function sfxSwing(){ beep('sawtooth',240,0.12,0.06); setTimeout(()=>beep('triangle',130,0.08,0.04),30); }
-  function sfxDoor(open){ beep('square', open?180:120,0.09,0.05); setTimeout(()=>beep('triangle',open?90:70,0.12,0.04),25); }
-  function sfxKill(){ beep('sine',880,0.08,0.07); setTimeout(()=>beep('sine',1175,0.12,0.05),60); }
+  function sfxSwing(){ osc('sawtooth', 300, 0.08, 0.05); setTimeout(()=>osc('triangle', 170, 0.11, 0.04), 30); }
+  function sfxDoor(open){ osc('square', open ? 210 : 120, 0.09, 0.045); setTimeout(()=>osc('triangle', open ? 100 : 70, 0.14, 0.04), 35); }
+  function sfxKill(){ osc('sine', 880, 0.08, 0.07); setTimeout(()=>osc('sine', 1320, 0.1, 0.06), 65); }
 
-  function speakEnemy(e,text){
+  function speakEnemy(e, text){
     if(!('speechSynthesis' in window)) return;
     const u = new SpeechSynthesisUtterance(text);
-    u.lang='ro-RO';
-    if(e.voice==='serious'){ u.pitch=0.75; u.rate=0.9; }
-    else { u.pitch=1.45; u.rate=1.15; }
+    u.lang = 'ro-RO';
+    if(e.voice === 'serious'){ u.pitch = 0.75; u.rate = 0.88; }
+    else { u.pitch = 1.42; u.rate = 1.16; }
     speechSynthesis.speak(u);
   }
 
-  function isDoorClosed(x,y){
-    const d = doors.get(key(x,y));
+  const speechPools = {
+    random: ['Eu sunt Gersiu!','Fac baie cu mama','Atentie la pas!','Te urmaresc!','Ai venit in cartierul meu!'],
+    attack: ['Vin peste tine!','Nu scapi!','Te rup!','Fara mila!'],
+    death: ['ma duc dupa cainele ala, baieti']
+  };
+
+  function makeGersiuTexture(style){
+    const c = document.createElement('canvas');
+    c.width = 64; c.height = 96;
+    const g = c.getContext('2d');
+    g.clearRect(0,0,64,96);
+    g.fillStyle = '#101114'; g.fillRect(0,66,64,30);
+    g.fillStyle = style===0 ? '#7b6a58' : (style===1 ? '#caa286' : '#d6ad93');
+    g.fillRect(14,14,36,44);
+    g.fillStyle = style===1 ? '#9f7c62' : '#6a4f3f';
+    if(style===1){ g.fillRect(12,8,40,9); }
+    else { g.fillRect(12,8,40,12); }
+    if(style===0){
+      g.fillStyle = '#111'; g.fillRect(16,28,32,8); g.fillRect(11,30,5,5); g.fillRect(48,30,5,5);
+    } else {
+      g.fillStyle = '#241f1b'; g.fillRect(20,30,6,4); g.fillRect(38,30,6,4);
+    }
+    g.fillStyle = '#2b2017'; g.fillRect(28,42,8,4);
+    g.fillStyle = style===2 ? '#a82828' : '#4a4a4a'; g.fillRect(8,58,48,28);
+    g.fillStyle = '#2a2a2a'; g.fillRect(22,86,20,8);
+    return g.getImageData(0,0,64,96);
+  }
+  const gersiuTex = [makeGersiuTexture(0), makeGersiuTexture(1), makeGersiuTexture(2)];
+
+  function isDoorClosed(x, y){
+    const d = doors.get(key(x, y));
     return !!(d && !d.open);
   }
-  function isSolidCell(x,y){
-    const t = get(x,y);
-    if(t===7) return isDoorClosed(x,y);
-    return t!==0;
+  function isSolid(x, y){
+    const t = cell(x, y);
+    if(t === 7) return isDoorClosed(x, y);
+    return t !== 0;
   }
-  function passable(x,y){
-    const cx = Math.floor(x), cy = Math.floor(y);
-    return !isSolidCell(cx,cy);
-  }
+  function passable(x, y){ return !isSolid(Math.floor(x), Math.floor(y)); }
 
-  function resolveMove(nx,ny,r){
-    let x=player.x,y=player.y;
-    if(passable(nx,y) && !isSolidCell(Math.floor(nx + Math.sign(nx-x)*r), Math.floor(y))) x=nx;
-    if(passable(x,ny) && !isSolidCell(Math.floor(x), Math.floor(ny + Math.sign(ny-y)*r))) y=ny;
-    player.x=x; player.y=y;
+  function moveBody(obj, nx, ny){
+    if(passable(nx, obj.y)) obj.x = nx;
+    if(passable(obj.x, ny)) obj.y = ny;
   }
 
   function toggleDoorFacing(){
-    let best=null, bestDist=1.4;
+    let best = null;
+    let bestDist = 1.4;
     for(const d of doors.values()){
-      const dx=(d.x+0.5)-player.x, dy=(d.y+0.5)-player.y;
-      const dist=Math.hypot(dx,dy);
-      if(dist>bestDist) continue;
-      const ang=Math.atan2(dy,dx)-player.a;
-      const ca=Math.abs(Math.atan2(Math.sin(ang),Math.cos(ang)));
-      if(ca<0.45){ best=d; bestDist=dist; }
+      const dx = d.x + 0.5 - player.x;
+      const dy = d.y + 0.5 - player.y;
+      const dist = Math.hypot(dx, dy);
+      if(dist > bestDist) continue;
+      const da = Math.abs(Math.atan2(Math.sin(Math.atan2(dy, dx)-player.a), Math.cos(Math.atan2(dy, dx)-player.a)));
+      if(da < 0.45){ best = d; bestDist = dist; }
     }
-    if(best){ best.open=!best.open; sfxDoor(best.open); }
+    if(best){ best.open = !best.open; sfxDoor(best.open); }
   }
 
   function spawnGersiu(){
     const before = enemies.length;
-    const candidates=[];
-    for(let y=1;y<mapH-1;y++)for(let x=1;x<mapW-1;x++){
-      if(!passable(x+0.5,y+0.5)) continue;
-      const dx=x+0.5-player.x, dy=y+0.5-player.y;
-      const d=Math.hypot(dx,dy);
-      if(d>=4 && d<=10 && d>=2) candidates.push([x+0.5,y+0.5]);
+    let spot = null;
+    const annulus = [];
+    for(let y = 1; y < mapH - 1; y++){
+      for(let x = 1; x < mapW - 1; x++){
+        if(!passable(x + 0.5, y + 0.5)) continue;
+        const d = Math.hypot(x + 0.5 - player.x, y + 0.5 - player.y);
+        if(d >= 4 && d <= 10 && d >= 2) annulus.push([x + 0.5, y + 0.5]);
+      }
     }
-    let pos = candidates.length ? candidates[(Math.random()*candidates.length)|0] : null;
-    if(!pos){
-      const all=[];
-      for(let y=1;y<mapH-1;y++)for(let x=1;x<mapW-1;x++){
-        if(!passable(x+0.5,y+0.5)) continue;
-        const d=Math.hypot(x+0.5-player.x,y+0.5-player.y);
-        if(d>=2) all.push([x+0.5,y+0.5]);
+    if(annulus.length) spot = annulus[(Math.random() * annulus.length) | 0];
+    if(!spot){
+      const all = [];
+      for(let y = 1; y < mapH - 1; y++){
+        for(let x = 1; x < mapW - 1; x++){
+          if(!passable(x + 0.5, y + 0.5)) continue;
+          if(Math.hypot(x + 0.5 - player.x, y + 0.5 - player.y) >= 2) all.push([x + 0.5, y + 0.5]);
+        }
       }
       if(!all.length) return false;
-      pos=all[(Math.random()*all.length)|0];
+      spot = all[(Math.random() * all.length) | 0];
     }
-    const type=Math.random()<0.5?'sword':'fist';
-    const voice=Math.random()<0.5?'serious':'comic';
-    enemies.push({x:pos[0],y:pos[1],hp:70,alive:true,type,voice,sayCd:1+Math.random()*2,spd:1.15});
-    return enemies.length===before+1;
+    const type = Math.random() < 0.5 ? 'sword' : 'fist';
+    const voice = Math.random() < 0.5 ? 'serious' : 'comic';
+    const look = (Math.random() * 3) | 0;
+    enemies.push({x:spot[0],y:spot[1],hp:80,alive:true,type,voice,look,spd:1.35,sayCd:1.5+Math.random()*3,bob:Math.random()*Math.PI*2});
+    return enemies.length === before + 1;
   }
 
-  const lines = {
-    random:["Eu sunt Gersiu!","Fac baie cu mama","Te vad!","Nu scapi!"],
-    attack:["Vin peste tine!","Tai tot!","Fara mila!"],
-    death:["ma duc dupa cainele ala, baieti"]
-  };
-
-  function updateEnemies(dt){
-    for(const e of enemies){
-      if(!e.alive) continue;
-      const dx=player.x-e.x, dy=player.y-e.y;
-      const d=Math.hypot(dx,dy)+1e-6;
-      const vx=dx/d*e.spd*dt, vy=dy/d*e.spd*dt;
-      const nx=e.x+vx, ny=e.y+vy;
-      if(passable(nx,e.y)) e.x=nx;
-      if(passable(e.x,ny)) e.y=ny;
-      e.sayCd -= dt;
-      if(e.sayCd<=0){
-        const pool = d<1.8 ? lines.attack : lines.random;
-        speakEnemy(e, pool[(Math.random()*pool.length)|0]);
-        e.sayCd = 3 + Math.random()*5;
-      }
-    }
+  function killEnemy(e){
+    e.alive = false;
+    kills++;
+    killsEl.textContent = String(kills);
+    scoreEl.classList.remove('pulse'); void scoreEl.offsetWidth; scoreEl.classList.add('pulse');
+    sfxKill();
+    speakEnemy(e, speechPools.death[0]);
   }
 
   function tryAttack(){
-    if(attackTimer>0.001) return;
-    attackTimer = 0.32;
+    if(attackT > 0.001) return;
+    attackT = 0.35;
     sfxSwing();
-    for(const e of enemies){
+    for(let i = 0; i < enemies.length; i++){
+      const e = enemies[i];
       if(!e.alive) continue;
-      const dx=e.x-player.x, dy=e.y-player.y;
-      const dist=Math.hypot(dx,dy);
-      if(dist>1.8) continue;
-      const ang=Math.atan2(dy,dx)-player.a;
-      const da=Math.abs(Math.atan2(Math.sin(ang),Math.cos(ang)));
-      if(da<=Math.PI/8){
-        e.hp -= 40;
-        if(e.hp<=0){
-          e.alive=false;
-          kills++;
-          killsEl.textContent=String(kills);
-          scoreEl.classList.remove('pulse'); void scoreEl.offsetWidth; scoreEl.classList.add('pulse');
-          sfxKill();
-          speakEnemy(e, lines.death[0]);
-        }
+      const dx = e.x - player.x, dy = e.y - player.y;
+      const dist = Math.hypot(dx, dy);
+      if(dist > 1.8) continue;
+      const da = Math.abs(Math.atan2(Math.sin(Math.atan2(dy, dx)-player.a), Math.cos(Math.atan2(dy, dx)-player.a)));
+      if(da <= Math.PI / 8){
+        e.hp -= 42;
+        if(e.hp <= 0) killEnemy(e);
       }
     }
   }
 
-  function wallShade(hex, amt){
-    const c=parseInt(hex.slice(1),16);
-    const r=Math.max(0,Math.min(255,((c>>16)&255)*amt|0));
-    const g=Math.max(0,Math.min(255,((c>>8)&255)*amt|0));
-    const b=Math.max(0,Math.min(255,(c&255)*amt|0));
-    return 'rgb('+r+','+g+','+b+')';
-  }
-
-  function roomAroundWall(x,y){
-    const n=[[1,0],[-1,0],[0,1],[0,-1]];
-    for(let i=0;i<n.length;i++){
-      const rx=x+n[i][0], ry=y+n[i][1];
-      if(rx>=0&&ry>=0&&rx<mapW&&ry<mapH){
-        const id=roomId[idx(rx,ry)];
-        if(id) return id;
+  function updateEnemies(dt){
+    for(let i = 0; i < enemies.length; i++){
+      const e = enemies[i];
+      if(!e.alive) continue;
+      const dx = player.x - e.x, dy = player.y - e.y;
+      const d = Math.hypot(dx, dy) + 1e-6;
+      const vx = dx / d * e.spd * dt;
+      const vy = dy / d * e.spd * dt;
+      moveBody(e, e.x + vx, e.y + vy);
+      e.sayCd -= dt;
+      e.bob += dt * 5;
+      if(e.sayCd <= 0){
+        const pool = d < 2 ? speechPools.attack : speechPools.random;
+        speakEnemy(e, pool[(Math.random() * pool.length) | 0]);
+        e.sayCd = 2.8 + Math.random() * 4.8;
       }
     }
-    return 1;
   }
 
-  function cast(){
-    ctx.fillStyle='#3a3a46'; ctx.fillRect(0,0,lowW,lowH/2);
-    ctx.fillStyle='#222'; ctx.fillRect(0,lowH/2,lowW,lowH/2);
-
-    for(let x=0;x<lowW;x++){
-      const camX = (2*x/lowW-1) * Math.tan(cam.fov/2);
-      const rayDirX = Math.cos(player.a) + -Math.sin(player.a)*camX;
-      const rayDirY = Math.sin(player.a) + Math.cos(player.a)*camX;
-      let mapX = player.x|0, mapY = player.y|0;
-      const ddx=Math.abs(1/(rayDirX||1e-9)), ddy=Math.abs(1/(rayDirY||1e-9));
-      let sdx, sdy, stepX, stepY;
-      if(rayDirX<0){stepX=-1; sdx=(player.x-mapX)*ddx;} else {stepX=1; sdx=(mapX+1-player.x)*ddx;}
-      if(rayDirY<0){stepY=-1; sdy=(player.y-mapY)*ddy;} else {stepY=1; sdy=(mapY+1-player.y)*ddy;}
-      let hit=false, side=0, t=0, tile=1;
-      while(!hit && t<60){
-        if(sdx<sdy){ sdx+=ddx; mapX+=stepX; side=0; }
-        else { sdy+=ddy; mapY+=stepY; side=1; }
-        t++;
-        tile=get(mapX,mapY);
-        if(tile===7){ if(isDoorClosed(mapX,mapY)) hit=true; }
-        else if(tile!==0) hit=true;
+  function wallColorFor(mx, my, side){
+    const rid = (function(){
+      const n = [[1,0],[-1,0],[0,1],[0,-1]];
+      for(let i = 0; i < 4; i++){
+        const rx = mx + n[i][0], ry = my + n[i][1];
+        if(rx < 0 || ry < 0 || rx >= mapW || ry >= mapH) continue;
+        const r = roomId[idx(rx, ry)];
+        if(r) return r;
       }
-      const dist = hit ? (side===0 ? (mapX-player.x+(1-stepX)/2)/(rayDirX||1e-9) : (mapY-player.y+(1-stepY)/2)/(rayDirY||1e-9)) : 999;
-      zbuf[x]=dist;
-      const lineH=(lowH/(dist||1e-9))|0;
-      const drawStart=Math.max(0, ((-lineH/2 + lowH/2)|0));
-      const drawEnd=Math.min(lowH-1, ((lineH/2 + lowH/2)|0));
-      let color='#777';
-      if(tile===7) color='#8b5a2b';
-      else color=wallRoomColor[roomAroundWall(mapX,mapY)]||'#666';
-      ctx.fillStyle=wallShade(color, side?0.72:1);
-      ctx.fillRect(x,drawStart,1,drawEnd-drawStart+1);
+      return 0;
+    })();
+    if(cell(mx,my) === 7) return side ? '#6a3f1c' : '#8d5a2b';
+    const base = roomWallBase[rid] || '#58606e';
+    const c = parseInt(base.slice(1), 16);
+    const wave = 0.8 + ((mx * 17 + my * 31) & 3) * 0.05;
+    const shade = side ? 0.72 : 1;
+    const m = wave * shade;
+    const r = Math.min(255, ((c >> 16) & 255) * m | 0);
+    const g = Math.min(255, ((c >> 8) & 255) * m | 0);
+    const b = Math.min(255, (c & 255) * m | 0);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  function castWalls(){
+    const horizon = (lowH >> 1) + (player.pitch | 0);
+    const gradSky = ctx.createLinearGradient(0, 0, 0, horizon);
+    gradSky.addColorStop(0, '#4d6b88');
+    gradSky.addColorStop(1, '#2e3646');
+    ctx.fillStyle = gradSky;
+    ctx.fillRect(0, 0, lowW, Math.max(0, horizon));
+
+    const gradFloor = ctx.createLinearGradient(0, horizon, 0, lowH);
+    gradFloor.addColorStop(0, '#2f2b26');
+    gradFloor.addColorStop(1, '#1f1d1a');
+    ctx.fillStyle = gradFloor;
+    ctx.fillRect(0, horizon, lowW, lowH - horizon);
+
+    const dirX = Math.cos(player.a), dirY = Math.sin(player.a);
+    const planeX = -dirY * Math.tan(cam.fov * 0.5);
+    const planeY = dirX * Math.tan(cam.fov * 0.5);
+
+    for(let x = 0; x < lowW; x++){
+      const camX = 2 * x / lowW - 1;
+      const rayDirX = dirX + planeX * camX;
+      const rayDirY = dirY + planeY * camX;
+
+      let mapX = player.x | 0;
+      let mapY = player.y | 0;
+      const deltaX = Math.abs(1 / (rayDirX || 1e-9));
+      const deltaY = Math.abs(1 / (rayDirY || 1e-9));
+      let stepX = 1, stepY = 1;
+      let sideDistX, sideDistY;
+
+      if(rayDirX < 0){ stepX = -1; sideDistX = (player.x - mapX) * deltaX; }
+      else { sideDistX = (mapX + 1 - player.x) * deltaX; }
+      if(rayDirY < 0){ stepY = -1; sideDistY = (player.y - mapY) * deltaY; }
+      else { sideDistY = (mapY + 1 - player.y) * deltaY; }
+
+      let hit = false, side = 0, tile = 1, guard = 0;
+      while(!hit && guard < 96){
+        if(sideDistX < sideDistY){ sideDistX += deltaX; mapX += stepX; side = 0; }
+        else { sideDistY += deltaY; mapY += stepY; side = 1; }
+        tile = cell(mapX, mapY);
+        if(tile === 7){ if(isDoorClosed(mapX, mapY)) hit = true; }
+        else if(tile !== 0) hit = true;
+        guard++;
+      }
+
+      const dist = hit ? (side === 0
+        ? (mapX - player.x + (1 - stepX) * 0.5) / (rayDirX || 1e-9)
+        : (mapY - player.y + (1 - stepY) * 0.5) / (rayDirY || 1e-9)) : 999;
+      zbuf[x] = dist;
+      rayHitX[x] = mapX;
+      rayHitY[x] = mapY;
+
+      const h = (lowH / Math.max(0.0001, dist)) | 0;
+      const y0 = Math.max(0, ((-h * 0.5 + horizon) | 0));
+      const y1 = Math.min(lowH - 1, ((h * 0.5 + horizon) | 0));
+
+      ctx.fillStyle = wallColorFor(mapX, mapY, side);
+      ctx.fillRect(x, y0, 1, y1 - y0 + 1);
     }
   }
 
   function renderSprites(){
-    const alive = enemies.filter(e=>e.alive);
-    alive.sort((a,b)=>((b.x-player.x)**2+(b.y-player.y)**2)-((a.x-player.x)**2+(a.y-player.y)**2));
-    for(const e of alive){
-      const sx=e.x-player.x, sy=e.y-player.y;
-      const invDet = 1 / ((Math.cos(player.a)*Math.cos(player.a+Math.PI/2)-Math.sin(player.a+Math.PI/2)*Math.sin(player.a))||1e-9);
-      const transformX = invDet * (Math.cos(player.a+Math.PI/2)*sx - Math.cos(player.a)*sy);
-      const transformY = invDet * (-Math.sin(player.a+Math.PI/2)*sx + Math.sin(player.a)*sy);
-      if(transformY<=0.05) continue;
-      const spriteScreenX = ((lowW/2)*(1+transformX/transformY))|0;
-      const spriteH = Math.abs((lowH/transformY)|0);
-      const drawStartY = Math.max(0, -spriteH/2 + lowH/2);
-      const drawEndY = Math.min(lowH-1, spriteH/2 + lowH/2);
-      const spriteW = spriteH;
-      const drawStartX = Math.max(0, -spriteW/2 + spriteScreenX);
-      const drawEndX = Math.min(lowW-1, spriteW/2 + spriteScreenX);
-      for(let stripe=drawStartX|0; stripe<=drawEndX; stripe++){
-        if(transformY<zbuf[stripe]){
-          const body=e.type==='sword'?'#c33':'#3cc';
-          ctx.fillStyle=body;
-          ctx.fillRect(stripe,drawStartY,1,drawEndY-drawStartY);
-          if(e.type==='sword'){ ctx.fillStyle='#ddd'; ctx.fillRect(stripe,drawStartY+4,1,8); }
+    sortBuf.length = 0;
+    for(let i = 0; i < enemies.length; i++) if(enemies[i].alive) sortBuf.push(enemies[i]);
+    sortBuf.sort((a, b) => {
+      const da = (a.x-player.x)*(a.x-player.x)+(a.y-player.y)*(a.y-player.y);
+      const db = (b.x-player.x)*(b.x-player.x)+(b.y-player.y)*(b.y-player.y);
+      return db - da;
+    });
+
+    const dirX = Math.cos(player.a), dirY = Math.sin(player.a);
+    const planeX = -dirY * Math.tan(cam.fov * 0.5);
+    const planeY = dirX * Math.tan(cam.fov * 0.5);
+    const invDet = 1 / (planeX * dirY - dirX * planeY || 1e-9);
+    const horizon = (lowH >> 1) + (player.pitch | 0);
+
+    for(let n = 0; n < sortBuf.length; n++){
+      const e = sortBuf[n];
+      const spX = e.x - player.x;
+      const spY = e.y - player.y;
+      const trX = invDet * (dirY * spX - dirX * spY);
+      const trY = invDet * (-planeY * spX + planeX * spY);
+      if(trY <= 0.08) continue;
+
+      const screenX = ((lowW * 0.5) * (1 + trX / trY)) | 0;
+      const scale = Math.abs(lowH / trY);
+      const bob = Math.sin(e.bob) * 6;
+      const h = (scale * 1.05) | 0;
+      const w = (scale * 0.68) | 0;
+      const y0 = ((-h * 0.5 + horizon + bob) | 0);
+      const y1 = ((h * 0.5 + horizon + bob) | 0);
+      const x0 = ((-w * 0.5 + screenX) | 0);
+      const x1 = ((w * 0.5 + screenX) | 0);
+
+      const tex = gersiuTex[e.look];
+      const tw = tex.width, th = tex.height, data = tex.data;
+      for(let x = x0; x <= x1; x++){
+        if(x < 0 || x >= lowW) continue;
+        if(trY >= zbuf[x]) continue;
+        const tx = ((x - x0) / Math.max(1, x1 - x0) * (tw - 1)) | 0;
+        for(let y = y0; y <= y1; y++){
+          if(y < 0 || y >= lowH) continue;
+          const ty = ((y - y0) / Math.max(1, y1 - y0) * (th - 1)) | 0;
+          const p = (ty * tw + tx) << 2;
+          const a = data[p + 3];
+          if(a < 10) continue;
+          const r = data[p], g = data[p + 1], b = data[p + 2];
+          ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+          ctx.fillRect(x, y, 1, 1);
         }
+      }
+
+      if(e.type === 'sword'){
+        const bladeX = x1 - ((w * 0.15) | 0);
+        const bladeY = y0 + ((h * 0.35) | 0);
+        ctx.fillStyle = '#d7d7d7';
+        ctx.fillRect(bladeX, bladeY, 2, (h * 0.28) | 0);
+      } else {
+        ctx.fillStyle = '#222';
+        ctx.fillRect(x1 - 2, y0 + ((h * 0.45) | 0), 2, 6);
       }
     }
   }
 
   function drawSword(){
-    const t = attackTimer>0 ? (1-attackTimer/0.32) : 0;
-    const swing = Math.sin(Math.min(1,t)*Math.PI);
-    const baseX = lowW*0.73 + swing*55;
-    const baseY = lowH*0.78 + swing*12;
-    ctx.fillStyle='#4a2e1b';
-    ctx.fillRect(baseX|0, baseY|0, 46, 12);
-    ctx.fillStyle='#d9d9d9';
+    const s = attackT > 0 ? Math.sin((1 - attackT / 0.35) * Math.PI) : 0;
+    const bx = lowW * 0.72 + s * 80;
+    const by = lowH * 0.8 + player.pitch * 0.3 + s * 18;
+    ctx.fillStyle = '#3e2a1b';
+    ctx.fillRect(bx|0, by|0, 52, 13);
+    ctx.fillStyle = '#dadada';
     ctx.beginPath();
-    ctx.moveTo(baseX+18, baseY+5);
-    ctx.lineTo(baseX-32-swing*40, baseY-42-swing*22);
-    ctx.lineTo(baseX-22-swing*36, baseY-48-swing*26);
-    ctx.lineTo(baseX+24, baseY+2);
+    ctx.moveTo(bx + 22, by + 6);
+    ctx.lineTo(bx - 44 - s * 52, by - 58 - s * 26);
+    ctx.lineTo(bx - 30 - s * 43, by - 65 - s * 30);
+    ctx.lineTo(bx + 30, by + 2);
     ctx.fill();
   }
 
   function drawMinimap(){
     if(!showMinimap) return;
-    const s=8, ox=8, oy=8;
-    vctx.save();
-    vctx.globalAlpha=0.9;
-    for(let y=0;y<mapH;y++)for(let x=0;x<mapW;x++){
-      const t=get(x,y);
-      if(t===1){vctx.fillStyle='#666'; vctx.fillRect(ox+x*s,oy+y*s,s,s);}
-      else if(t===7 && isDoorClosed(x,y)){vctx.fillStyle='#a06d33'; vctx.fillRect(ox+x*s,oy+y*s,s,s);}
-      else {vctx.fillStyle='#111'; vctx.fillRect(ox+x*s,oy+y*s,s,s);}    
+    const s = 6;
+    const ox = 8, oy = 8;
+    out.save();
+    out.globalAlpha = 0.92;
+    for(let y = 0; y < mapH; y++){
+      for(let x = 0; x < mapW; x++){
+        const t = cell(x, y);
+        if(t === 1){ out.fillStyle = '#6b6b72'; }
+        else if(t === 7 && isDoorClosed(x, y)){ out.fillStyle = '#a36e34'; }
+        else { out.fillStyle = '#17191f'; }
+        out.fillRect(ox + x * s, oy + y * s, s, s);
+      }
     }
-    vctx.fillStyle='#0f0';
-    vctx.beginPath();
-    vctx.arc(ox+player.x*s,oy+player.y*s,3,0,Math.PI*2);vctx.fill();
-    vctx.strokeStyle='#0f0';
-    vctx.beginPath();
-    vctx.moveTo(ox+player.x*s,oy+player.y*s);
-    vctx.lineTo(ox+(player.x+Math.cos(player.a))*s, oy+(player.y+Math.sin(player.a))*s);
-    vctx.stroke();
-    vctx.fillStyle='#f33';
-    for(const e of enemies){ if(!e.alive) continue; vctx.fillRect(ox+e.x*s-2,oy+e.y*s-2,4,4); }
-    vctx.restore();
+    out.fillStyle = '#0f0';
+    out.beginPath(); out.arc(ox + player.x * s, oy + player.y * s, 3, 0, Math.PI * 2); out.fill();
+    out.strokeStyle = '#0f0'; out.beginPath();
+    out.moveTo(ox + player.x * s, oy + player.y * s);
+    out.lineTo(ox + (player.x + Math.cos(player.a) * 1.6) * s, oy + (player.y + Math.sin(player.a) * 1.6) * s);
+    out.stroke();
+    out.fillStyle = '#ff4040';
+    for(let i = 0; i < enemies.length; i++) if(enemies[i].alive) out.fillRect(ox + enemies[i].x * s - 2, oy + enemies[i].y * s - 2, 4, 4);
+    out.restore();
   }
 
-  function resize(){
-    viewCanvas.width = window.innerWidth;
-    viewCanvas.height = window.innerHeight;
+  function resize(){ canvas.width = innerWidth; canvas.height = innerHeight; }
+
+  function onLook(dx, dy){
+    player.a += dx * 0.0026;
+    player.pitch = Math.max(-95, Math.min(95, player.pitch + dy * 0.18));
   }
 
-  document.addEventListener('keydown',e=>{
-    keys[e.code]=true;
-    if(e.code==='KeyE') toggleDoorFacing();
-    if(e.code==='KeyM') showMinimap=!showMinimap;
-    if(e.code==='Space') tryAttack();
+  addEventListener('keydown', (e)=>{
+    keys[e.code] = true;
+    if(e.code === 'KeyE') toggleDoorFacing();
+    if(e.code === 'KeyM') showMinimap = !showMinimap;
+    if(e.code === 'Space') tryAttack();
   });
-  document.addEventListener('keyup',e=>{ keys[e.code]=false; });
-  viewCanvas.addEventListener('click',()=>{ if(document.pointerLockElement!==viewCanvas) viewCanvas.requestPointerLock(); if(ac&&ac.state==='suspended') ac.resume(); });
-  document.addEventListener('pointerlockchange',()=>{ pointerLocked=document.pointerLockElement===viewCanvas; dragging=false; });
-  viewCanvas.addEventListener('mousemove',e=>{
-    if(pointerLocked){ player.a += e.movementX*0.0026; }
-    else if(dragging){ const dx=e.clientX-lastMouseX; lastMouseX=e.clientX; player.a += dx*0.004; }
+  addEventListener('keyup', (e)=>{ keys[e.code] = false; });
+
+  canvas.addEventListener('click', ()=>{
+    if(document.pointerLockElement !== canvas) canvas.requestPointerLock();
+    if(ac && ac.state === 'suspended') ac.resume();
   });
-  viewCanvas.addEventListener('mousedown',e=>{
-    if(e.button===0){ if(!pointerLocked){ dragging=true; lastMouseX=e.clientX; } tryAttack(); }
+  document.addEventListener('pointerlockchange', ()=>{ pointerLocked = document.pointerLockElement === canvas; dragging = false; });
+  canvas.addEventListener('mousemove', (e)=>{
+    if(pointerLocked) onLook(e.movementX, e.movementY);
+    else if(dragging){
+      onLook(e.clientX - lastMouseX, e.clientY - lastMouseY);
+      lastMouseX = e.clientX; lastMouseY = e.clientY;
+    }
   });
-  window.addEventListener('mouseup',()=>dragging=false);
-  viewCanvas.addEventListener('contextmenu',e=>e.preventDefault());
-  spawnBtn.addEventListener('click',spawnGersiu);
-  mapBtn.addEventListener('click',()=>showMinimap=!showMinimap);
-  window.addEventListener('resize',resize);
+  canvas.addEventListener('mousedown', (e)=>{
+    if(e.button === 0){
+      if(!pointerLocked){ dragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; }
+      tryAttack();
+    }
+  });
+  addEventListener('mouseup', ()=>{ dragging = false; });
+  canvas.addEventListener('contextmenu', (e)=>e.preventDefault());
+
+  spawnBtn.addEventListener('click', spawnGersiu);
+  mapBtn.addEventListener('click', ()=>showMinimap = !showMinimap);
+  addEventListener('resize', resize);
 
   function movePlayer(dt){
-    const move=3.4*dt, strafe=3.0*dt;
-    let mx=0,my=0;
-    if(keys.KeyW){ mx += Math.cos(player.a)*move; my += Math.sin(player.a)*move; }
-    if(keys.KeyS){ mx -= Math.cos(player.a)*move; my -= Math.sin(player.a)*move; }
-    if(keys.KeyA){ mx += Math.cos(player.a-Math.PI/2)*strafe; my += Math.sin(player.a-Math.PI/2)*strafe; }
-    if(keys.KeyD){ mx += Math.cos(player.a+Math.PI/2)*strafe; my += Math.sin(player.a+Math.PI/2)*strafe; }
-    resolveMove(player.x+mx, player.y+my, 0.15);
+    const walk = 4.1 * dt;
+    const strafe = 3.8 * dt;
+    let vx = 0, vy = 0;
+    if(keys.KeyW){ vx += Math.cos(player.a) * walk; vy += Math.sin(player.a) * walk; }
+    if(keys.KeyS){ vx -= Math.cos(player.a) * walk; vy -= Math.sin(player.a) * walk; }
+    if(keys.KeyA){ vx += Math.cos(player.a - Math.PI * 0.5) * strafe; vy += Math.sin(player.a - Math.PI * 0.5) * strafe; }
+    if(keys.KeyD){ vx += Math.cos(player.a + Math.PI * 0.5) * strafe; vy += Math.sin(player.a + Math.PI * 0.5) * strafe; }
+    moveBody(player, player.x + vx, player.y + vy);
   }
 
   function runTests(){
-    const errs=[];
-    const vis=new Uint8Array(mapW*mapH);
-    let comps=0;
-    for(let y=0;y<mapH;y++)for(let x=0;x<mapW;x++){
-      const i=idx(x,y);
-      if(roomId[i]===0||vis[i]) continue;
-      comps++;
-      const q=[[x,y]]; vis[i]=1;
-      for(let qi=0; qi<q.length; qi++){
-        const p=q[qi];
-        const n=[[1,0],[-1,0],[0,1],[0,-1]];
-        for(let j=0;j<4;j++){
-          const nx=p[0]+n[j][0], ny=p[1]+n[j][1];
-          if(nx<0||ny<0||nx>=mapW||ny>=mapH) continue;
-          const ii=idx(nx,ny);
-          if(roomId[ii]!==0 && !vis[ii]){ vis[ii]=1; q.push([nx,ny]); }
+    const errs = [];
+
+    const visited = new Uint8Array(mapW * mapH);
+    let comps = 0;
+    for(let y = 0; y < mapH; y++){
+      for(let x = 0; x < mapW; x++){
+        const i = idx(x, y);
+        if(roomId[i] === 0 || visited[i]) continue;
+        comps++;
+        const qx = [x], qy = [y];
+        visited[i] = 1;
+        for(let qi = 0; qi < qx.length; qi++){
+          const px = qx[qi], py = qy[qi];
+          const n = [[1,0],[-1,0],[0,1],[0,-1]];
+          for(let k = 0; k < 4; k++){
+            const nx = px + n[k][0], ny = py + n[k][1];
+            if(nx < 0 || ny < 0 || nx >= mapW || ny >= mapH) continue;
+            const ni = idx(nx, ny);
+            if(roomId[ni] !== 0 && !visited[ni]){ visited[ni] = 1; qx.push(nx); qy.push(ny); }
+          }
         }
       }
     }
-    if(comps!==5) errs.push('Map room count must be exactly 5, got '+comps);
-    if(doors.size<5) errs.push('doors.size must be >=5, got '+doors.size);
-    const roomDoorCounts={1:0,2:0,3:0,4:0,5:0};
+    if(comps !== 5) errs.push('Map has ' + comps + ' room-regions, expected exactly 5');
+
+    if(doors.size < 5) errs.push('doors.size is ' + doors.size + ', expected >= 5');
+
+    const roomDoorCounts = {1:0,2:0,3:0,4:0,5:0};
     for(const d of doors.values()){
-      const n=[[1,0],[-1,0],[0,1],[0,-1]];
-      const seen={};
-      for(let i=0;i<4;i++){
-        const rx=d.x+n[i][0], ry=d.y+n[i][1];
-        if(rx<0||ry<0||rx>=mapW||ry>=mapH) continue;
-        const rid=roomId[idx(rx,ry)]; if(rid) seen[rid]=1;
+      const seen = {};
+      const n = [[1,0],[-1,0],[0,1],[0,-1]];
+      for(let i = 0; i < 4; i++){
+        const rx = d.x + n[i][0], ry = d.y + n[i][1];
+        if(rx < 0 || ry < 0 || rx >= mapW || ry >= mapH) continue;
+        const rid = roomId[idx(rx, ry)];
+        if(rid) seen[rid] = 1;
       }
-      for(const k in seen) roomDoorCounts[k]++;
+      for(const id in seen) roomDoorCounts[id]++;
     }
-    for(let r=1;r<=5;r++) if(roomDoorCounts[r]<1) errs.push('Room '+r+' has no door');
-    if(!passable(player.x,player.y)) errs.push('Player spawn not passable');
-    const before=enemies.length;
-    if(!spawnGersiu() || enemies.length!==before+1) errs.push('Spawning did not increase enemies length by 1');
-    if(errs.length){ console.error('runTests FAILED:\n - '+errs.join('\n - ')); }
+    for(let r = 1; r <= 5; r++) if(roomDoorCounts[r] < 1) errs.push('Room ' + r + ' has no adjacent door');
+
+    if(!passable(player.x, player.y)) errs.push('Player is not in passable cell');
+
+    const before = enemies.length;
+    if(!spawnGersiu() || enemies.length !== before + 1) errs.push('Spawning did not increase enemies length by 1');
+
+    if(errs.length) console.error('runTests FAILED:\n - ' + errs.join('\n - '));
     else console.log('runTests PASSED');
   }
 
-  let last=performance.now(), fps=60, acc=0;
-  function frame(now){
-    const dt=Math.min(0.05,(now-last)/1000); last=now;
-    fps = fps*0.9 + (1/dt)*0.1;
+  function loop(now){
+    loop.last = loop.last || now;
+    const dt = Math.min(0.05, (now - loop.last) * 0.001);
+    loop.last = now;
+    fps = fps * 0.9 + (1 / Math.max(0.001, dt)) * 0.1;
+
     movePlayer(dt);
     updateEnemies(dt);
-    if(attackTimer>0) attackTimer=Math.max(0,attackTimer-dt);
+    if(attackT > 0) attackT = Math.max(0, attackT - dt);
 
-    cast();
+    castWalls();
     renderSprites();
     drawSword();
 
-    vctx.clearRect(0,0,viewCanvas.width,viewCanvas.height);
-    vctx.drawImage(lowCanvas,0,0,viewCanvas.width,viewCanvas.height);
+    out.clearRect(0, 0, canvas.width, canvas.height);
+    out.drawImage(low, 0, 0, canvas.width, canvas.height);
     drawMinimap();
 
-    acc+=dt;
-    if(acc>0.1){
-      let alive=0; for(let i=0;i<enemies.length;i++) if(enemies[i].alive) alive++;
-      hud.textContent = 'FPS: '+fps.toFixed(1)+'\nPOS: '+player.x.toFixed(2)+', '+player.y.toFixed(2)+'\nANGLE: '+player.a.toFixed(2)+'\nENEMIES ALIVE: '+alive;
-      acc=0;
-    }
-    requestAnimationFrame(frame);
+    let alive = 0;
+    for(let i = 0; i < enemies.length; i++) if(enemies[i].alive) alive++;
+    hud.textContent = 'FPS: ' + fps.toFixed(1) +
+      '\nPOS: ' + player.x.toFixed(2) + ', ' + player.y.toFixed(2) +
+      '\nANGLE: ' + player.a.toFixed(2) +
+      '\nPITCH: ' + player.pitch.toFixed(1) +
+      '\nENEMIES ALIVE: ' + alive +
+      '\nMAP: 40x28 OPEN-PLAZA';
+
+    requestAnimationFrame(loop);
   }
 
   resize();
   runTests();
-  requestAnimationFrame(frame);
+  requestAnimationFrame(loop);
 })();
 </script>
 </body>
